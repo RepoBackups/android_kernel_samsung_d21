@@ -4135,9 +4135,25 @@ static struct platform_device msm_tsens_device = {
 static struct msm_thermal_data msm_thermal_pdata = {
 	.sensor_id = 0,
 	.poll_ms = 250,
+#ifdef CONFIG_BRICKED_THERMAL
+	.shutdown_temp = 80,
+
+	.allowed_max_high = 76,
+	.allowed_max_low = 71,
+	.allowed_max_freq = 384000,
+
+	.allowed_mid_high = 72,
+	.allowed_mid_low = 67,
+	.allowed_mid_freq = 810000,
+
+	.allowed_low_high = 70,
+	.allowed_low_low = 64,
+	.allowed_low_freq = 1350000,
+#else
 	.limit_temp_degC = 60,
 	.temp_hysteresis_degC = 10,
 	.freq_step = 2,
+#endif
 };
 
 /* Bluetooth */
