@@ -5,7 +5,7 @@
  *            (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
  *                      Jun Nakajima <jun.nakajima@intel.com>
  *            (C)  2012 Dennis Rassmann <showp1984@gmail.com>
- *            (c)  2013 The Linux Foundation. All rights reserved.
+ *            (c)  2013, 2015 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -23,7 +23,7 @@
 #include <linux/hrtimer.h>
 #include <linux/tick.h>
 #include <linux/ktime.h>
-#include <linux/smpboot.h>
+#include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/input.h>
 #include <linux/workqueue.h>
@@ -127,11 +127,13 @@ struct cpu_bds_info_s {
 	 */
 	struct mutex timer_mutex;
 
+	struct task_struct *sync_thread;
+	wait_queue_head_t sync_wq;
 	atomic_t src_sync_cpu;
+	atomic_t being_woken;
 	atomic_t sync_enabled;
 };
 static DEFINE_PER_CPU(struct cpu_bds_info_s, od_cpu_bds_info);
-static DEFINE_PER_CPU(struct task_struct *, sync_thread);
 
 static inline void bds_timer_init(struct cpu_bds_info_s *bds_info);
 static inline void bds_timer_exit(struct cpu_bds_info_s *bds_info);
@@ -211,40 +213,6 @@ static struct bds_tuners {
 #endif
 	.input_boost = 0,
 };
-
-static inline u64 get_cpu_idle_time_jiffy(unsigned int cpu, u64 *wall)
-{
-	u64 idle_time;
-	u64 cur_wall_time;
-	u64 busy_time;
-
-	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
-
-	busy_time  = kcpustat_cpu(cpu).cpustat[CPUTIME_USER];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_IRQ];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SOFTIRQ];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_STEAL];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_NICE];
-
-	idle_time = cur_wall_time - busy_time;
-	if (wall)
-		*wall = jiffies_to_usecs(cur_wall_time);
-
-	return jiffies_to_usecs(idle_time);
-}
-
-static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
-{
-	u64 idle_time = get_cpu_idle_time_us(cpu, NULL);
-
-	if (idle_time == -1ULL)
-		return get_cpu_idle_time_jiffy(cpu, wall);
-	else
-		idle_time += get_cpu_iowait_time_us(cpu, wall);
-
-	return idle_time;
-}
 
 static inline cputime64_t get_cpu_iowait_time(unsigned int cpu, cputime64_t *wall)
 {
@@ -641,7 +609,7 @@ static ssize_t store_ignore_nice_load(struct kobject *a, struct attribute *b,
 		struct cpu_bds_info_s *bds_info;
 		bds_info = &per_cpu(od_cpu_bds_info, j);
 		bds_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&bds_info->prev_cpu_wall);
+						&bds_info->prev_cpu_wall, 0);
 		if (bds_tuners_ins.ignore_nice)
 			bds_info->prev_cpu_nice = kcpustat_cpu(j).cpustat[CPUTIME_NICE];
 
@@ -1072,7 +1040,7 @@ static void bds_check_cpu(struct cpu_bds_info_s *this_bds_info)
 
 		j_bds_info = &per_cpu(od_cpu_bds_info, j);
 
-		cur_idle_time = get_cpu_idle_time(j, &cur_wall_time);
+		cur_idle_time = get_cpu_idle_time(j, &cur_wall_time, 0);
 		cur_iowait_time = get_cpu_iowait_time(j, &cur_wall_time);
 
 		wall_time = (unsigned int)
@@ -1488,7 +1456,7 @@ static void bds_refresh_callback(struct work_struct *work)
 			policy->cur = target_freq;
 
 		this_bds_info->prev_cpu_idle = get_cpu_idle_time(cpu,
-				&this_bds_info->prev_cpu_wall);
+				&this_bds_info->prev_cpu_wall, 0);
 	}
 
 bail_incorrect_governor:
@@ -1506,6 +1474,16 @@ static int bds_migration_notify(struct notifier_block *nb,
 		&per_cpu(od_cpu_bds_info, target_cpu);
 
 	atomic_set(&target_bds_info->src_sync_cpu, (int)arg);
+	/*
+	* Avoid issuing recursive wakeup call, as sync thread itself could be
+	* seen as migrating triggering this notification. Note that sync thread
+	* of a cpu could be running for a short while with its affinity broken
+	* because of CPU hotplug.
+	*/
+	if (!atomic_cmpxchg(&target_bds_info->being_woken, 0, 1)) {
+		wake_up(&target_bds_info->sync_wq);
+		atomic_set(&target_bds_info->being_woken, 0);
+	}
 
 	return NOTIFY_OK;
 }
@@ -1513,6 +1491,94 @@ static int bds_migration_notify(struct notifier_block *nb,
 static struct notifier_block bds_migration_nb = {
 	.notifier_call = bds_migration_notify,
 };
+
+static int sync_pending(struct cpu_bds_info_s *this_bds_info)
+{
+	return atomic_read(&this_bds_info->src_sync_cpu) >= 0;
+}
+
+static int bds_sync_thread(void *data)
+{
+	int src_cpu, cpu = (int)data;
+	unsigned int src_freq, src_max_load;
+	struct cpu_bds_info_s *this_bds_info, *src_bds_info;
+	struct cpufreq_policy *policy;
+	int delay;
+
+	this_bds_info = &per_cpu(od_cpu_bds_info, cpu);
+
+	while (1) {
+		wait_event_interruptible(this_bds_info->sync_wq,
+			   sync_pending(this_bds_info) ||
+			   kthread_should_stop());
+
+		if (kthread_should_stop())
+			break;
+
+		get_online_cpus();
+
+		src_cpu = atomic_read(&this_bds_info->src_sync_cpu);
+		src_bds_info = &per_cpu(od_cpu_bds_info, src_cpu);
+		if (src_bds_info != NULL &&
+		    src_bds_info->cur_policy != NULL) {
+			src_freq = src_bds_info->cur_policy->cur;
+			src_max_load = src_bds_info->max_load;
+		} else {
+			src_freq = bds_tuners_ins.sync_freq;
+			src_max_load = 0;
+		}
+
+		if (lock_policy_rwsem_write(cpu) < 0)
+			goto bail_acq_sema_failed;
+
+		if (!atomic_read(&this_bds_info->sync_enabled)) {
+			atomic_set(&this_bds_info->src_sync_cpu, -1);
+			put_online_cpus();
+			unlock_policy_rwsem_write(cpu);
+			continue;
+		}
+
+		policy = this_bds_info->cur_policy;
+		if (!policy) {
+			/* CPU not using badass governor */
+			goto bail_incorrect_governor;
+		}
+		delay = usecs_to_jiffies(bds_tuners_ins.sampling_rate);
+
+
+		if (policy->cur < src_freq) {
+			/* cancel the next badass sample */
+			cancel_delayed_work_sync(&this_bds_info->work);
+
+			/*
+			 * Arch specific cpufreq driver may fail.
+			 * Don't update governor frequency upon failure.
+			 */
+			if (__cpufreq_driver_target(policy, src_freq,
+						    CPUFREQ_RELATION_L) >= 0) {
+				policy->cur = src_freq;
+				if (src_max_load > this_bds_info->max_load) {
+					this_bds_info->max_load = src_max_load;
+					this_bds_info->prev_load = src_max_load;
+				}
+			}
+
+			/* reschedule the next badass sample */
+			mutex_lock(&this_bds_info->timer_mutex);
+			queue_delayed_work_on(cpu, bds_wq,
+					      &this_bds_info->work, delay);
+			mutex_unlock(&this_bds_info->timer_mutex);
+		}
+
+bail_incorrect_governor:
+		unlock_policy_rwsem_write(cpu);
+bail_acq_sema_failed:
+		put_online_cpus();
+		atomic_set(&this_bds_info->src_sync_cpu, -1);
+	}
+
+	return 0;
+}
 
 #if !defined(CONFIG_SEC_DVFS)
 static void bds_input_event(struct input_handle *handle, unsigned int type,
@@ -1602,98 +1668,6 @@ static struct input_handler bds_input_handler = {
 };
 #endif
 
-static int sync_pending(struct cpu_bds_info_s *this_bds_info)
-{
-	return atomic_read(&this_bds_info->src_sync_cpu) >= 0;
-}
-
-static int bds_sync_should_run(unsigned int dest_cpu)
-{
-	struct cpu_bds_info_s *this_bds_info;
-
-	this_bds_info = &per_cpu(od_cpu_bds_info, dest_cpu);
-
-	return sync_pending(this_bds_info);
-}
-
-static void run_bds_sync(unsigned int dest_cpu)
-{
-	int src_cpu, cpu = dest_cpu;
-	unsigned int src_freq, src_max_load;
-	struct cpu_bds_info_s *this_bds_info, *src_bds_info;
-	struct cpufreq_policy *policy;
-	int delay;
-
-	this_bds_info = &per_cpu(od_cpu_bds_info, cpu);
-
-	get_online_cpus();
-
-	src_cpu = atomic_read(&this_bds_info->src_sync_cpu);
-	src_bds_info = &per_cpu(od_cpu_bds_info, src_cpu);
-	if (src_bds_info != NULL && src_bds_info->cur_policy != NULL) {
-		src_freq = src_bds_info->cur_policy->cur;
-		src_max_load = src_bds_info->max_load;
-	} else {
-		src_freq = bds_tuners_ins.sync_freq;
-		src_max_load = 0;
-	}
-
-	if (lock_policy_rwsem_write(cpu) < 0)
-		goto bail_acq_sema_failed;
-
-	if (!atomic_read(&this_bds_info->sync_enabled)) {
-		atomic_set(&this_bds_info->src_sync_cpu, -1);
-		put_online_cpus();
-		unlock_policy_rwsem_write(cpu);
-		return;
-	}
-
-	policy = this_bds_info->cur_policy;
-	if (!policy) {
-		/* CPU not using badass governor */
-		goto bail_incorrect_governor;
-	}
-	delay = usecs_to_jiffies(bds_tuners_ins.sampling_rate);
-
-
-	if (policy->cur < src_freq) {
-		/* cancel the next badass sample */
-		cancel_delayed_work_sync(&this_bds_info->work);
-
-		/*
-		 * Arch specific cpufreq driver may fail.
-		 * Don't update governor frequency upon failure.
-		 */
-		if (__cpufreq_driver_target(policy, src_freq,
-					    CPUFREQ_RELATION_L) >= 0) {
-			policy->cur = src_freq;
-			if (src_max_load > this_bds_info->max_load) {
-				this_bds_info->max_load = src_max_load;
-				this_bds_info->prev_load = src_max_load;
-			}
-		}
-
-		/* reschedule the next badass sample */
-		mutex_lock(&this_bds_info->timer_mutex);
-		schedule_delayed_work_on(cpu, &this_bds_info->work,
-					 delay);
-		mutex_unlock(&this_bds_info->timer_mutex);
-	}
-
-bail_incorrect_governor:
-	unlock_policy_rwsem_write(cpu);
-bail_acq_sema_failed:
-	put_online_cpus();
-	atomic_set(&this_bds_info->src_sync_cpu, -1);
-}
-
-static struct smp_hotplug_thread bds_sync_threads = {
-	.store		= &sync_thread,
-	.thread_should_run = bds_sync_should_run,
-	.thread_fn	= run_bds_sync,
-	.thread_comm	= "bds_sync/%u",
-};
-
 static int cpufreq_governor_bds(struct cpufreq_policy *policy,
 				   unsigned int event)
 {
@@ -1718,10 +1692,12 @@ static int cpufreq_governor_bds(struct cpufreq_policy *policy,
 			j_bds_info->cur_policy = policy;
 
 			j_bds_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&j_bds_info->prev_cpu_wall);
+						&j_bds_info->prev_cpu_wall, 0);
 			if (bds_tuners_ins.ignore_nice)
 				j_bds_info->prev_cpu_nice =
 						kcpustat_cpu(j).cpustat[CPUTIME_NICE];
+			set_cpus_allowed(j_bds_info->sync_thread,
+					 *cpumask_of(j));
 			if (!bds_tuners_ins.powersave_bias)
 				atomic_set(&j_bds_info->sync_enabled, 1);
 		}
@@ -1836,7 +1812,7 @@ static int __init cpufreq_gov_bds_init(void)
 {
 	u64 idle_time;
 	unsigned int i;
-	int rc, cpu = get_cpu();
+	int cpu = get_cpu();
 
 	idle_time = get_cpu_idle_time_us(cpu, NULL);
 	put_cpu();
@@ -1873,11 +1849,13 @@ static int __init cpufreq_gov_bds_init(void)
 		bds_work->cpu = i;
 
 		atomic_set(&this_bds_info->src_sync_cpu, -1);
-	}
+		atomic_set(&this_bds_info->being_woken, 0);
+		init_waitqueue_head(&this_bds_info->sync_wq);
 
-	rc = smpboot_register_percpu_thread(&bds_sync_threads);
-	if (rc)
-		printk(KERN_ERR "Failed to register bds_sync threads\n");
+		this_bds_info->sync_thread = kthread_run(bds_sync_thread,
+							 (void *)i,
+							 "bds_sync/%d", i);
+	}
 
 	return cpufreq_register_governor(&cpufreq_gov_badass);
 }
@@ -1891,6 +1869,7 @@ static void __exit cpufreq_gov_bds_exit(void)
 		struct cpu_bds_info_s *this_bds_info =
 			&per_cpu(od_cpu_bds_info, i);
 		mutex_destroy(&this_bds_info->timer_mutex);
+		kthread_stop(this_bds_info->sync_thread);
 	}
 	destroy_workqueue(bds_wq);
 }
