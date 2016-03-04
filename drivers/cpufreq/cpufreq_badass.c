@@ -128,7 +128,7 @@ struct cpu_bds_info_s {
 	struct mutex timer_mutex;
 
 	struct task_struct *sync_thread;
-	wait_queue_head_t sync wq;
+	wait_queue_head_t sync_wq;
 	atomic_t src_sync_cpu;
 	atomic_t being_woken;
 	atomic_t sync_enabled;
@@ -1480,9 +1480,9 @@ static int bds_migration_notify(struct notifier_block *nb,
 	* of a cpu could be running for a short while with its affinity broken
 	* because of CPU hotplug.
 	*/
-	if (!atomic_cmpxchg(&target_dbs_info->being_woken, 0, 1)) {
-		wake_up(&target_dbs_info->sync_wq);
-		atomic_set(&target_dbs_info->being_woken, 0);
+	if (!atomic_cmpxchg(&target_bds_info->being_woken, 0, 1)) {
+		wake_up(&target_bds_info->sync_wq);
+		atomic_set(&target_bds_info->being_woken, 0);
 	}
 
 	return NOTIFY_OK;
@@ -1849,7 +1849,7 @@ static int __init cpufreq_gov_bds_init(void)
 		bds_work->cpu = i;
 
 		atomic_set(&this_bds_info->src_sync_cpu, -1);
-		atomic_set(&this_dbs_info->being_woken, 0);
+		atomic_set(&this_bds_info->being_woken, 0);
 		init_waitqueue_head(&this_bds_info->sync_wq);
 
 		this_bds_info->sync_thread = kthread_run(bds_sync_thread,
