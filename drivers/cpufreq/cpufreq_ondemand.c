@@ -35,16 +35,18 @@
  * It helps to keep variable names smaller, simpler
  */
 
-#define DEF_FREQUENCY_DOWN_DIFFERENTIAL		(10)
-#define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define DEF_SAMPLING_DOWN_FACTOR		(1)
-#define MAX_SAMPLING_DOWN_FACTOR		(100000)
-#define MICRO_FREQUENCY_DOWN_DIFFERENTIAL	(3)
-#define MICRO_FREQUENCY_UP_THRESHOLD		(95)
-#define MICRO_FREQUENCY_MIN_SAMPLE_RATE		(10000)
-#define MIN_FREQUENCY_UP_THRESHOLD		(11)
-#define MAX_FREQUENCY_UP_THRESHOLD		(100)
-#define MIN_FREQUENCY_DOWN_DIFFERENTIAL		(1)
+#define DEF_FREQUENCY_DOWN_DIFFERENTIAL         (10)
+#define DEF_FREQUENCY_UP_THRESHOLD              (90)
+#define DEF_FREQUENCY_UP_THRESHOLD_ANY_LOAD     (80)
+#define DEF_FREQUENCY_UP_THRESHOLD_MULTI_CORE   (70)
+#define DEF_SAMPLING_DOWN_FACTOR                (4)
+#define MAX_SAMPLING_DOWN_FACTOR                (100000)
+#define MICRO_FREQUENCY_DOWN_DIFFERENTIAL       (3)
+#define MICRO_FREQUENCY_UP_THRESHOLD            (95)
+#define MICRO_FREQUENCY_MIN_SAMPLE_RATE         (10000)
+#define MIN_FREQUENCY_UP_THRESHOLD              (11)
+#define MAX_FREQUENCY_UP_THRESHOLD              (100)
+#define MIN_FREQUENCY_DOWN_DIFFERENTIAL         (1)
 
 /*
  * The polling frequency of this governor depends on the capability of
@@ -149,16 +151,18 @@ static struct dbs_tuners {
 	unsigned int io_is_busy;
 	unsigned int input_boost;
 } dbs_tuners_ins = {
-	.up_threshold_multi_core = DEF_FREQUENCY_UP_THRESHOLD,
+	.sampling_rate = 50000,
+	.up_threshold_multi_core = DEF_FREQUENCY_UP_THRESHOLD_MULTI_CORE,
 	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
 	.sampling_down_factor = DEF_SAMPLING_DOWN_FACTOR,
 	.down_differential = DEF_FREQUENCY_DOWN_DIFFERENTIAL,
 	.down_differential_multi_core = MICRO_FREQUENCY_DOWN_DIFFERENTIAL,
-	.up_threshold_any_cpu_load = DEF_FREQUENCY_UP_THRESHOLD,
+	.up_threshold_any_cpu_load = DEF_FREQUENCY_UP_THRESHOLD_ANY_LOAD,
 	.ignore_nice = 0,
 	.powersave_bias = 0,
 	.sync_freq = 0,
 	.optimal_freq = 0,
+	.io_is_busy = 1,
 	.input_boost = 0,
 };
 
